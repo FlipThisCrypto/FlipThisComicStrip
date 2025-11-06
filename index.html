@@ -1,0 +1,1719 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Changed title to v5.0 -->
+    <title>AI Comic Creator v5.0</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bangers&display=swap" rel="stylesheet">
+    <!-- Load Cropper.js -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"></script>
+    
+    <script type="module">
+        // Import Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, addDoc, onSnapshot, query, where, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase & App State ---
+        let app, auth, db;
+        let userId = null;
+        let isAuthReady = false;
+        let appId = 'default-app-id'; // This will be replaced by __app_id
+        let comicsCollectionRef = null; // To store the reference to the user's comics collection
+        
+        // --- App State ---
+        const comicPanels = [
+            { baseImage: null, baseMimeType: null, generatedImage: null, prompt: "", dialogueType: "none", dialogue: ["", "", ""], narration: "", soundEffect: "" },
+            { baseImage: null, baseMimeType: null, generatedImage: null, prompt: "", dialogueType: "none", dialogue: ["", "", ""], narration: "", soundEffect: "" },
+            { baseImage: null, baseMimeType: null, generatedImage: null, prompt: "", dialogueType: "none", dialogue: ["", "", ""], narration: "", soundEffect: "" }
+        ];
+        let croppers = [null, null, null];
+        // <-- UPGRADE: Added Master Reference Image state -->
+        let masterReferenceImage = { base64: null, mimeType: null, dataUrl: null };
+        
+        // --- Canvas Config (Horizontal Layout) ---
+        const CANVAS_WIDTH = 2000;
+        const CANVAS_HEIGHT = 1000;
+        // ... existing canvas config ...
+        const PADDING = 50; 
+        const PANEL_GUTTER = 15;
+        const innerWidth = CANVAS_WIDTH - (PADDING * 2); 
+        const innerHeight = CANVAS_HEIGHT - (PADDING * 2);
+        const totalPanelWidthSpace = innerWidth - (4 * PANEL_GUTTER);
+        const PANEL_WIDTH = Math.floor(totalPanelWidthSpace / 3);
+        const PANEL_WIDTH_LAST = totalPanelWidthSpace - (2 * PANEL_WIDTH);
+        const PANEL_HEIGHT = innerHeight - (2 * PANEL_GUTTER);
+        const PANEL_ASPECT_RATIO = PANEL_WIDTH / PANEL_HEIGHT; 
+        
+        // --- DOM Elements ---
+        let canvas, ctx, downloadLink, generateBtn, autoStoryBtn, globalLoading;
+        let saveComicBtn, loadComicBtn, savedComicsSelect;
+        // <-- UPGRADE: Added new DOM elements -->
+        let masterPromptInput, masterReferenceUpload, masterReferenceImagePreview, masterReferencePlaceholder, clearMasterReferenceBtn, generateAllImagesBtn;
+
+
+        // --- Utility Functions ---
+
+        /**
+         * Gets the API key from the input field.
+         * @returns {string | null} The API key or null if missing.
+         */
+        function getApiKey() {
+            const key = document.getElementById('geminiApiKey').value;
+            if (!key) {
+                showModal("API Key Missing", "Please enter your Gemini API Key in the Global Settings to use AI features.");
+                return null;
+            }
+            return key;
+        }
+        
+        /**
+         * Converts a File object to a Base64 encoded string and data URL.
+         * @param {File} file - The file to convert.
+         * @returns {Promise<{base64: string, dataUrl: string, mimeType: string}>} A promise that resolves with base64 data, a data URL, and the mime type.
+         */
+        function fileToData(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = () => {
+                    const dataUrl = reader.result;
+                    const base64 = dataUrl.split(',')[1];
+                    const mimeType = dataUrl.split(',')[0].split(':')[1].split(';')[0]; 
+                    resolve({ base64, dataUrl, mimeType });
+                };
+                reader.onerror = error => reject(error);
+            });
+        }
+
+        /**
+         * Implements exponential backoff for API calls.
+         * @param {Function} callback - The function to retry.
+         * @param {number} [maxRetries=5] - Maximum number of retries.
+         * @param {number} [delay=1000] - Initial delay in ms.
+         */
+        async function fetchWithBackoff(callback, maxRetries = 5, delay = 1000) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 30000); 
+                    const result = await callback(controller.signal);
+                    clearTimeout(timeoutId); 
+                    return result;
+                } catch (error) {
+                    if (error && error.isClientError) {
+                        throw error;
+                    }
+                    if (error.name === 'AbortError') {
+                        console.error("API call timed out after 30 seconds.");
+                        const timeoutError = new Error("API Error: Request timed out after 30 seconds.");
+                        timeoutError.isClientError = true;
+                        throw timeoutError;
+                    }
+                    if (i === maxRetries - 1) throw error;
+                    let retryDelay = delay * Math.pow(2, i);
+                    if (error.retryAfter) {
+                        console.warn(`API rate limit hit. Retrying after ${error.retryAfter}ms...`);
+                        retryDelay = Math.max(retryDelay, error.retryAfter);
+                    } else {
+                        console.warn(`API call failed. Retrying in ${retryDelay}ms...`, error ? error.message : 'Unknown error');
+                    }
+                    await new Promise(res => setTimeout(res, retryDelay));
+                }
+            }
+        }
+
+        // --- API Call Functions ---
+
+        /**
+         * <-- UPGRADE: Renamed from generateAiImage to callGenerateAiApi -->
+         * Calls the Gemini API to generate an image.
+         * @param {string} prompt - The text prompt for the image.
+         * @param {string | null} base64ImageData - Optional base64 image data for image-to-image.
+         * @param {string} [mimeType='image/png'] - The mime type of the base64 image data.
+         * @returns {Promise<string | null>} A promise that resolves with the new Base64 image data.
+         */
+        async function callGenerateAiApi(prompt, base64ImageData = null, mimeType = 'image/png') {
+            const apiKey = getApiKey();
+            if (!apiKey) return null;
+
+            const imageApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`;
+            const parts = [{ text: prompt }];
+            
+            // <-- UPGRADE: Use master reference image if provided -->
+            if (masterReferenceImage.base64) {
+                 parts.push({
+                    inlineData: {
+                        mimeType: masterReferenceImage.mimeType,
+                        data: masterReferenceImage.base64
+                    }
+                });
+            } else if (base64ImageData) {
+                // Fallback to panel image (for non-master-image workflow)
+                 parts.push({
+                    inlineData: {
+                        mimeType: mimeType,
+                        data: base64ImageData
+                    }
+                });
+            }
+
+            const payload = {
+                contents: [{ parts: parts }],
+                generationConfig: {
+                    responseModalities: ['TEXT', 'IMAGE']
+                },
+            };
+            
+            const apiCallback = async (signal) => {
+                const response = await fetch(imageApiUrl, {
+                    // ... existing fetch config ...
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: signal 
+                });
+
+                if (!response.ok) {
+                    // ... existing error handling ...
+                    let errorBody = "Unknown error";
+                    let retryAfter = null;
+                    let isClientError = false;
+                    try {
+                        const errorJson = await response.json();
+                        errorBody = errorJson?.error?.message || JSON.stringify(errorJson);
+                        if (response.status === 429 && errorBody.includes("Please retry in")) {
+                            const match = errorBody.match(/Please retry in (\d+\.?\d*)s/);
+                            if (match && match[1]) {
+                                retryAfter = parseFloat(match[1]) * 1000 + 500; 
+                            }
+                        }
+                        if ([400, 401, 403].includes(response.status)) {
+                            isClientError = true;
+                        }
+                        if (response.status === 429 && !retryAfter) {
+                            isClientError = true; 
+                        }
+                    } catch (e) {
+                        if (response.status === 429) {
+                            errorBody = "Quota exceeded (429). Could not parse error details.";
+                        } else {
+                            errorBody = response.statusText || "Failed to parse error response";
+                        }
+                        if ([400, 401, 403, 429].includes(response.status)) {
+                             isClientError = true;
+                        }
+                    }
+                    const error = new Error(`API Error: ${response.status} ${errorBody}`);
+                    error.isClientError = isClientError;
+                    error.retryAfter = retryAfter;
+                    throw error;
+                }
+
+                return await response.json();
+            };
+            
+            const result = await fetchWithBackoff(apiCallback);
+            const base64Data = result?.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+            
+            if (!base64Data) {
+                throw new Error("No image data returned from API.");
+            }
+            return base64Data;
+        }
+
+        /**
+         * Generates a 3-panel comic script using the Gemini API.
+         * @returns {Promise<object | null>} A promise that resolves with the structured comic script.
+         */
+        async function generateAiStory() {
+            const apiKey = getApiKey();
+            if (!apiKey) return null;
+
+            const textApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            
+            // <-- UPGRADE: Added master prompt placeholder -->
+            const systemPrompt = `You are a creative comic book writer. Your task is to generate a 3-panel comic script.
+User's master prompt/style guide: {{MASTER_PROMPT}}
+The user may provide 1 base image. Use this image as inspiration if provided.
+Your output MUST be a valid JSON object.
+The JSON object must have a top-level key "panels" which is an array of 3 objects.
+Each object in the "panels" array must have:
+1. "image_prompt": A string describing the visual scene for an AI image generator (e.g., "A superhero flying over a city, comic book style").
+2. "narration": A string for a narration box. Use "..." if no narration.
+3. "dialogue": A string for a single speech bubble. Use "..." if no dialogue.
+
+Prioritize narration OR dialogue for each panel, not both. If you write dialogue, make narration "...". If you write narration, make dialogue "...".
+Keep all text concise.
+
+Example Response:
+{
+  "panels": [
+    {
+      "image_prompt": "A close-up of a detective looking surprised, holding a glowing rock. Pop art style.",
+      "narration": "...",
+      "dialogue": "What... what is this thing?"
+    },
+    {
+      "image_prompt": "The glowing rock is pulsing with energy, casting shadows on the detective's face.",
+      "narration": "Meanwhile, the rock began to glow brighter...",
+      "dialogue": "..."
+    },
+    {
+      "image_prompt": "A wide shot of the city, with a giant monster made of light attacking. Retro comic style.",
+      "narration": "...",
+      "dialogue": "Oh no! It's happening!"
+    }
+  ]
+}
+`;
+            // --- User Prompt ---
+            let userQuery = "Generate a 3-panel comic script.";
+            const parts = [{ text: userQuery }];
+            
+            // <-- UPGRADE: Use Master Reference Image -->
+            if (masterReferenceImage.base64) {
+                userQuery = "Generate a 3-panel comic script inspired by this image.";
+                parts[0].text = userQuery;
+                parts.push({
+                    inlineData: {
+                        mimeType: masterReferenceImage.mimeType,
+                        data: masterReferenceImage.base64
+                    }
+                });
+            }
+
+            // --- Payload ---
+            const payload = {
+                contents: [{ role: "user", parts: parts }],
+                systemInstruction: {
+                    // <-- UPGRADE: Inject master prompt -->
+                    parts: [{ text: systemPrompt.replace('{{MASTER_PROMPT}}', masterPromptInput.value || 'None') }]
+                },
+                generationConfig: {
+                    // ... existing generation config ...
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "panels": {
+                                type: "ARRAY",
+                                items: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        "image_prompt": { "type": "STRING" },
+                                        "narration": { "type": "STRING" },
+                                        "dialogue": { "type": "STRING" }
+                                    },
+                                    required: ["image_prompt", "narration", "dialogue"]
+                                }
+                            }
+                        },
+                        required: ["panels"]
+                    }
+                }
+            };
+            
+            const apiCallback = async (signal) => {
+                const response = await fetch(textApiUrl, {
+                    // ... existing fetch config ...
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: signal
+                });
+
+                if (!response.ok) {
+                    // ... existing error handling ...
+                    let errorBody = "Unknown error";
+                    let retryAfter = null;
+                    let isClientError = false;
+                    try {
+                        const errorJson = await response.json();
+                        errorBody = errorJson?.error?.message || JSON.stringify(errorJson);
+                        if (response.status === 429 && errorBody.includes("Please retry in")) {
+                            const match = errorBody.match(/Please retry in (\d+\.?\d*)s/);
+                            if (match && match[1]) {
+                                retryAfter = parseFloat(match[1]) * 1000 + 500;
+                            }
+                        }
+                        if ([400, 401, 403].includes(response.status)) {
+                            isClientError = true;
+                        }
+                        if (response.status === 429 && !retryAfter) {
+                            isClientError = true; 
+                        }
+                    } catch (e) {
+                        if (response.status === 429) {
+                            errorBody = "Quota exceeded (429). Could not parse error details.";
+                        } else {
+                            errorBody = response.statusText || "Failed to parse error response";
+                        }
+                        if ([400, 401, 403, 429].includes(response.status)) {
+                             isClientError = true;
+                        }
+                    }
+                    const error = new Error(`API Error: ${response.status} ${errorBody}`);
+                    error.isClientError = isClientError;
+                    error.retryAfter = retryAfter;
+                    throw error;
+                }
+
+                return await response.json();
+            };
+            
+            const result = await fetchWithBackoff(apiCallback);
+            const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            
+            if (!jsonText) {
+                throw new Error("No story data returned from API.");
+            }
+            
+            try {
+                return JSON.parse(jsonText);
+            } catch (e) {
+                console.error("Failed to parse story JSON:", jsonText);
+                throw new Error("Invalid JSON format returned from API.");
+            }
+        }
+
+        // --- UI & State Functions ---
+
+        /**
+         * Updates the visibility of dialogue inputs based on the dropdown.
+         * @param {number} i - The 1-based index of the panel.
+         */
+        function updateDialogueInputs(i) {
+            const panel = comicPanels[i - 1];
+            const dialogueGroup1 = document.getElementById(`dialogue-group-1-${i}`);
+            const dialogueGroup2 = document.getElementById(`dialogue-group-2-${i}`);
+            const dialogueGroup3 = document.getElementById(`dialogue-group-3-${i}`);
+            const narrationGroup = document.getElementById(`narration-group-${i}`);
+            const soundGroup = document.getElementById(`sound-group-${i}`);
+
+            [dialogueGroup1, dialogueGroup2, dialogueGroup3, narrationGroup, soundGroup].forEach(el => el.classList.add('hidden'));
+
+            if (panel.dialogueType === '1') {
+                dialogueGroup1.classList.remove('hidden');
+            } else if (panel.dialogueType === '2') {
+                dialogueGroup1.classList.remove('hidden');
+                dialogueGroup2.classList.remove('hidden');
+            } else if (panel.dialogueType === '3') {
+                dialogueGroup1.classList.remove('hidden');
+                dialogueGroup2.classList.remove('hidden');
+                dialogueGroup3.classList.remove('hidden');
+            } else if (panel.dialogueType === 'narration') {
+                narrationGroup.classList.remove('hidden');
+            } else if (panel.dialogueType === 'sound') {
+                soundGroup.classList.remove('hidden');
+            }
+        }
+        
+        /**
+         * Handles the "Auto-Generate Story" button click.
+         */
+        async function handleAutoStory() {
+            if (!getApiKey()) return; 
+
+            globalLoading.classList.remove('hidden');
+            autoStoryBtn.disabled = true;
+            try {
+                const story = await generateAiStory();
+                if (!story) return; 
+
+                if (story.panels && story.panels.length === 3) {
+                    story.panels.forEach((panelData, index) => {
+                        const i = index + 1; 
+                        const panelState = comicPanels[index];
+
+                        panelState.prompt = panelData.image_prompt || "";
+                        panelState.narration = panelData.narration || "";
+                        panelState.dialogue[0] = panelData.dialogue || "";
+                        panelState.dialogue[1] = "";
+                        panelState.dialogue[2] = "";
+                        panelState.soundEffect = "";
+
+
+                        document.getElementById(`prompt-${i}`).value = panelState.prompt;
+                        document.getElementById(`narration-${i}`).value = panelState.narration;
+                        document.getElementById(`dialogue-1-${i}`).value = panelState.dialogue[0];
+                        document.getElementById(`dialogue-2-${i}`).value = "";
+                        document.getElementById(`dialogue-3-${i}`).value = "";
+                        document.getElementById(`sound-${i}`).value = "";
+
+                        if (panelState.narration && panelState.narration !== '...') {
+                            panelState.dialogueType = 'narration';
+                        } else if (panelState.dialogue[0] && panelState.dialogue[0] !== '...') {
+                            panelState.dialogueType = '1';
+                        } else {
+                            panelState.dialogueType = 'none';
+                        }
+                        document.getElementById(`dialogue-type-${i}`).value = panelState.dialogueType;
+                        updateDialogueInputs(i);
+                    });
+                    
+                    showModal("Story Generated!", "AI has generated a story. Review the prompts and text, then generate images and the final comic.");
+                    
+                } else {
+                    throw new Error("Invalid story format returned.");
+                }
+            } catch (error) {
+                console.error("Error auto-generating story:", error);
+                showModal("Error", `Failed to generate AI story. ${error.message}`);
+            } finally {
+                globalLoading.classList.add('hidden');
+                autoStoryBtn.disabled = false;
+            }
+        }
+
+        /**
+         * <-- UPGRADE: New function to handle generating a single panel's image -->
+         * This logic was extracted from the old event listener.
+         * @param {number} i - The 1-based index of the panel.
+         */
+        async function handleGeneratePanelImage(i) {
+            const panelIndex = i - 1;
+            const panelState = comicPanels[panelIndex];
+            
+            const loadingIndicator = document.getElementById(`loading-${i}`);
+            const uploadPlaceholder = document.getElementById(`upload-placeholder-${i}`);
+            const cropperContainer = document.getElementById(`cropper-container-${i}`);
+            const imagePreview = document.getElementById(`image-preview-${i}`);
+
+            const prompt = panelState.prompt;
+            
+            if (!prompt) {
+                showModal("Prompt Missing", `Please enter an AI Image Prompt for Panel ${i}.`);
+                return;
+            }
+            
+            if (!getApiKey()) return; // Check for API key
+
+            loadingIndicator.classList.remove('hidden');
+            uploadPlaceholder.classList.add('hidden'); // Hide placeholder during generation
+            
+            try {
+                // Combine panel prompt with master prompt
+                const masterPrompt = masterPromptInput.value;
+                const finalPrompt = prompt + (masterPrompt ? ", " + masterPrompt : "");
+
+                // Use master reference image if available
+                const baseImg = masterReferenceImage.base64 || panelState.generatedImage || panelState.baseImage;
+                const mime = masterReferenceImage.mimeType || (panelState.generatedImage ? 'image/png' : (panelState.baseMimeType || 'image/png'));
+                
+                // Use the refactored API call function
+                const newBase64 = await callGenerateAiApi(finalPrompt, baseImg, mime);
+                
+                if (newBase64) {
+                    panelState.generatedImage = newBase64; // Store new image
+                    const newDataUrl = `data:image/png;base64,${newBase64}`;
+                    imagePreview.src = newDataUrl;
+                    cropperContainer.classList.remove('hidden');
+
+                    // Destroy old cropper
+                    if (croppers[panelIndex]) {
+                        croppers[panelIndex].destroy();
+                    }
+                    
+                    // Create new cropper
+                    croppers[panelIndex] = new Cropper(imagePreview, {
+                        aspectRatio: PANEL_ASPECT_RATIO,
+                        viewMode: 1,
+                        dragMode: 'move',
+                        autoCrop: true,
+                        autoCropArea: 1.0,
+                        cropBoxResizable: false,
+                        cropBoxMovable: true,
+                        guides: false,
+                        center: true,
+                        background: false,
+                        toggleDragModeOnDblclick: false,
+                    });
+                }
+            } catch (error) {
+                console.error(`Error generating image for panel ${i}:`, error);
+                showModal("Image Generation Failed", `Error: ${error.message}`);
+                // Don't hide cropper if it was already showing
+                if (!croppers[panelIndex]) {
+                    uploadPlaceholder.classList.remove('hidden');
+                    cropperContainer.classList.add('hidden');
+                }
+            } finally {
+                loadingIndicator.classList.add('hidden');
+            }
+        }
+
+        /**
+         * <-- UPGRADE: New function to generate all 3 panel images -->
+         */
+        async function handleGenerateAllImages() {
+            if (!getApiKey()) return;
+            
+            // Check if there's at least one prompt
+            const hasAnyPrompt = comicPanels.some(p => p.prompt);
+            if (!hasAnyPrompt) {
+                showModal("No Prompts", "Please add prompts to the panels or use 'Auto-Generate Story' first.");
+                return;
+            }
+
+            globalLoading.classList.remove('hidden');
+            
+            for (let i = 1; i <= 3; i++) {
+                const panelState = comicPanels[i - 1];
+                if (panelState.prompt) {
+                    try {
+                        await handleGeneratePanelImage(i);
+                    } catch (error) {
+                        // Error is already shown by handleGeneratePanelImage
+                        console.error(`Failed to generate image for panel ${i}, stopping batch.`, error);
+                        showModal("Batch Error", `Failed to generate image for panel ${i}. Stopping batch process.`);
+                        break; // Stop loop on error
+                    }
+                }
+            }
+            
+            globalLoading.classList.add('hidden');
+        }
+
+        // --- Canvas Drawing ---
+
+        /**
+         * Draws the initial placeholder on the canvas.
+         */
+        function drawPlaceholderCanvas() {
+            canvas.width = CANVAS_WIDTH;
+            canvas.height = CANVAS_HEIGHT;
+            ctx.fillStyle = '#374151'; 
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            ctx.fillStyle = '#e5e7eb';
+            ctx.font = "bold 32px 'Inter', sans-serif";
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText("Your Comic Strip Will Appear Here", CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+        }
+
+        /**
+         * Main function to draw the complete comic strip onto the canvas.
+         */
+        async function drawComicStrip() {
+            globalLoading.classList.remove('hidden');
+            drawPlaceholderCanvas(); 
+            
+            const outerColor = document.getElementById('outerColor').value;
+            const topText = document.getElementById('topLeftText').value;
+            const bottomText = document.getElementById('bottomRightText').value;
+            
+            ctx.fillStyle = outerColor;
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            ctx.fillStyle = '#030712'; 
+            ctx.fillRect(PADDING, PADDING, innerWidth, innerHeight);
+
+            const panelY = PADDING + PANEL_GUTTER;
+            const panelX_coords = [
+                PADDING + PANEL_GUTTER, 
+                PADDING + PANEL_GUTTER + PANEL_WIDTH + PANEL_GUTTER, 
+                PADDING + PANEL_GUTTER + PANEL_WIDTH + PANEL_GUTTER + PANEL_WIDTH + PANEL_GUTTER 
+            ];
+            
+            for (let i = 0; i < 3; i++) {
+                const panel = comicPanels[i];
+                const panelX = panelX_coords[i];
+                const currentPanelWidth = (i === 2) ? PANEL_WIDTH_LAST : PANEL_WIDTH;
+                const cropper = croppers[i];
+
+                ctx.fillStyle = '#1f2937'; 
+                ctx.fillRect(panelX, panelY, currentPanelWidth, PANEL_HEIGHT);
+
+                if (cropper) {
+                    try {
+                        const croppedCanvas = cropper.getCroppedCanvas({
+                            width: currentPanelWidth,
+                            height: PANEL_HEIGHT,
+                            imageSmoothingEnabled: true,
+                            imageSmoothingQuality: 'high',
+                        });
+                        ctx.drawImage(croppedCanvas, panelX, panelY, currentPanelWidth, PANEL_HEIGHT);
+                    } catch (e) {
+                         console.error("Cropper error:", e);
+                        ctx.fillStyle = '#f87171'; 
+                        ctx.font = "24px 'Inter', sans-serif";
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(`Image Error`, panelX + currentPanelWidth / 2, panelY + PANEL_HEIGHT / 2);
+                    }
+                } else {
+                    ctx.fillStyle = '#9ca3af'; 
+                    ctx.font = "24px 'Inter', sans-serif";
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(`Panel ${i+1}`, panelX + currentPanelWidth / 2, panelY + PANEL_HEIGHT / 2);
+                }
+                
+                drawPanelText(panel, panelX, panelY, currentPanelWidth, PANEL_HEIGHT);
+            }
+            
+            ctx.font = "bold 36px 'Bangers', cursive";
+            ctx.fillStyle = '#ffffff';
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 5;
+            ctx.textBaseline = 'middle'; 
+            
+            if(topText) {
+                ctx.textAlign = 'left';
+                const topTextX = PADDING + PANEL_GUTTER;
+                const topTextY = PADDING / 2;
+                ctx.strokeText(topText, topTextX, topTextY);
+                ctx.fillText(topText, topTextX, topTextY);
+            }
+            
+            if(bottomText) {
+                ctx.font = "bold 24px 'Bangers', cursive";
+                ctx.textAlign = 'right';
+                const bottomTextX = CANVAS_WIDTH - PADDING - PANEL_GUTTER;
+                const bottomTextY = CANVAS_HEIGHT - (PADDING / 2);
+                ctx.strokeText(bottomText, bottomTextX, bottomTextY);
+                ctx.fillText(bottomText, bottomTextX, bottomTextY);
+            }
+
+            downloadLink.href = canvas.toDataURL('image/png');
+            downloadLink.style.display = 'inline-block';
+            globalLoading.classList.add('hidden');
+        }
+        
+        /**
+         * Draws text (bubbles, narration) for a single panel.
+         */
+        function drawPanelText(panel, x, y, w, h) {
+            ctx.font = "bold 22px 'Inter', sans-serif";
+            ctx.fillStyle = '#000000';
+            ctx.strokeStyle = '#FFFFFF';
+            ctx.lineWidth = 4;
+            
+            const bubblePositions = [
+                { x: x + w * 0.25, y: y + h * 0.25, tail: 'bl' }, 
+                { x: x + w * 0.75, y: y + h * 0.35, tail: 'br' }, 
+                { x: x + w * 0.50, y: y + h * 0.75, tail: 'tl' } 
+            ];
+
+            if (panel.dialogueType === 'narration') {
+                const text = panel.narration;
+                if (text && text !== '...') {
+                    drawNarrationBox(ctx, text, x, y, w, h);
+                }
+            } else if (panel.dialogueType === 'sound') {
+                const text = panel.soundEffect;
+                 if (text && text !== '...') {
+                    drawSoundEffect(ctx, text, x + w / 2, y + h / 2, w * 0.85);
+                 }
+            } else if (panel.dialogueType !== 'none') {
+                const numBubbles = parseInt(panel.dialogueType, 10);
+                for (let i = 0; i < numBubbles; i++) {
+                    const text = panel.dialogue[i];
+                    if (text && text !== '...') {
+                        const pos = bubblePositions[i];
+                        drawSpeechBubble(ctx, text, pos.x, pos.y, w * 0.4, pos.tail);
+                    }
+                }
+            }
+        }
+        
+        /**
+         * Wraps text to fit a max width.
+         */
+        function wrapText(text, maxWidth) {
+            if (!text) return [];
+            const words = text.split(' ');
+            const lines = [];
+            let currentLine = words[0] || '';
+            for (let i = 1; i < words.length; i++) {
+                const word = words[i];
+                const width = ctx.measureText(currentLine + " " + word).width;
+                if (width < maxWidth) {
+                    currentLine += " " + word;
+                } else {
+                    lines.push(currentLine);
+                    currentLine = word;
+                }
+            }
+            lines.push(currentLine);
+            return lines;
+        }
+
+        /**
+         * Draws a speech bubble.
+         */
+        function drawSpeechBubble(ctx, text, x, y, maxWidth, tailDirection) {
+            ctx.font = "bold 20px 'Inter', sans-serif";
+            const lines = wrapText(text, maxWidth - 20);
+            if (lines.length === 0) return;
+            const lineHeight = 24;
+            const bubbleHeight = lines.length * lineHeight + 20;
+            const bubbleWidth = maxWidth;
+            const bubbleX = x - bubbleWidth / 2;
+            const bubbleY = y - bubbleHeight / 2;
+            const r = 15; 
+            const tailSize = 15;
+            ctx.fillStyle = '#FFFFFF';
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(bubbleX + r, bubbleY);
+            ctx.lineTo(bubbleX + bubbleWidth - r, bubbleY);
+            ctx.quadraticCurveTo(bubbleX + bubbleWidth, bubbleY, bubbleX + bubbleWidth, bubbleY + r);
+            ctx.lineTo(bubbleX + bubbleWidth, bubbleY + bubbleHeight - r);
+            ctx.quadraticCurveTo(bubbleX + bubbleWidth, bubbleY + bubbleHeight, bubbleX + bubbleWidth - r, bubbleY + bubbleHeight);
+            ctx.lineTo(bubbleX + r, bubbleY + bubbleHeight);
+            ctx.quadraticCurveTo(bubbleX, bubbleY + bubbleHeight, bubbleX, bubbleY + bubbleHeight - r);
+            ctx.lineTo(bubbleX, bubbleY + r);
+            ctx.quadraticCurveTo(bubbleX, bubbleY, bubbleX + r, bubbleY);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+            ctx.beginPath();
+            if (tailDirection === 'bl') {
+                ctx.moveTo(bubbleX + r, bubbleY + bubbleHeight);
+                ctx.lineTo(bubbleX + r + tailSize, bubbleY + bubbleHeight);
+                ctx.lineTo(bubbleX + r, bubbleY + bubbleHeight + tailSize);
+            } else if (tailDirection === 'br') {
+                ctx.moveTo(bubbleX + bubbleWidth - r, bubbleY + bubbleHeight);
+                ctx.lineTo(bubbleX + bubbleWidth - r - tailSize, bubbleY + bubbleHeight);
+                ctx.lineTo(bubbleX + bubbleWidth - r, bubbleY + bubbleHeight + tailSize);
+            } else if (tailDirection === 'tl') {
+                ctx.moveTo(bubbleX + r, bubbleY);
+                ctx.lineTo(bubbleX + r + tailSize, bubbleY);
+                ctx.lineTo(bubbleX + r, bubbleY - tailSize);
+            } else { 
+                ctx.moveTo(bubbleX + bubbleWidth - r, bubbleY);
+                ctx.lineTo(bubbleX + bubbleWidth - r - tailSize, bubbleY);
+                ctx.lineTo(bubbleX + bubbleWidth - r, bubbleY - tailSize);
+            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#000000';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const textYStart = bubbleY + (bubbleHeight - (lines.length - 1) * lineHeight) / 2;
+            lines.forEach((line, index) => {
+                ctx.fillText(line, x, textYStart + index * lineHeight);
+            });
+        }
+        
+        /**
+         * Draws a narration box.
+         */
+        function drawNarrationBox(ctx, text, x, y, w, h) {
+            ctx.font = "italic bold 20px 'Inter', sans-serif";
+            const boxHeight = 60;
+            const boxY = y + 10; 
+            const boxX = x + 10;
+            const boxWidth = w - 20;
+            ctx.fillStyle = '#FFFF00'; 
+            ctx.strokeStyle = '#000000';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+            ctx.fillRect(boxX, boxY, boxWidth, boxHeight);
+            const lines = wrapText(text, boxWidth - 20);
+            if (lines.length === 0) return;
+            const lineHeight = 24;
+            ctx.fillStyle = '#000000';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const textYStart = boxY + (boxHeight - (lines.length - 1) * lineHeight) / 2;
+            lines.forEach((line, index) => {
+                if (index > 1) return; 
+                ctx.fillText(line, boxX + boxWidth / 2, textYStart + index * lineHeight);
+            });
+        }
+
+        /**
+         * Draws a stylized sound effect.
+         */
+        function drawSoundEffect(ctx, text, x, y, maxWidth) {
+            if (!text) return;
+            let fontSize = 96;
+            ctx.font = `bold ${fontSize}px 'Bangers', cursive`;
+            const textWidth = ctx.measureText(text).width;
+            if (textWidth > maxWidth) {
+                fontSize = (fontSize * maxWidth) / textWidth * 0.95; 
+                ctx.font = `bold ${fontSize}px 'Bangers', cursive`;
+            }
+            ctx.fillStyle = '#fefcbf'; 
+            ctx.strokeStyle = '#ef4444'; 
+            ctx.lineWidth = 10;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(-0.1); 
+            ctx.strokeText(text, 0, 0);
+            ctx.fillText(text, 0, 0);
+            ctx.restore();
+        }
+        
+        // --- Modal ---
+        function showModal(title, message) {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            document.getElementById('modal-backdrop').classList.remove('hidden');
+        }
+
+        function hideModal() {
+            document.getElementById('modal-backdrop').classList.add('hidden');
+        }
+
+        // --- Firebase Init & Data ---
+        
+        /**
+         * Initializes Firebase and sets up auth listener.
+         */
+        async function initFirebase() {
+            try {
+                let firebaseConfig;
+                if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+                    firebaseConfig = JSON.parse(__firebase_config);
+                } else {
+                    console.warn("Firebase config not found. Using dummy config for local testing. Firebase will not work.");
+                    firebaseConfig = {
+                        apiKey: "DUMMY_API_KEY",
+                        authDomain: "DUMMY_PROJECT_ID.firebaseapp.com",
+                        projectId: "DUMMY_PROJECT_ID",
+                        storageBucket: "DUMMY_PROJECT_ID.appspot.com",
+                        messagingSenderId: "DUMMY_SENDER_ID",
+                        appId: "DUMMY_APP_ID"
+                    };
+                }
+                
+                if (typeof __app_id !== 'undefined') {
+                    appId = __app_id;
+                }
+
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                    } else {
+                        try {
+                            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                                userId = auth.currentUser.uid;
+                            } else {
+                                await signInAnonymously(auth);
+                                userId = auth.currentUser.uid;
+                            }
+                        } catch (error) {
+                            console.error("Error signing in:", error);
+                        }
+                    }
+                    isAuthReady = true;
+                    if (userId) {
+                        comicsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/comics`);
+                        loadComicsList();
+                    } else {
+                        console.error("Authentication failed, user ID not available. Save/Load disabled.");
+                    }
+                });
+
+            } catch (e) {
+                console.error("Error initializing Firebase:", e);
+                if (e.message.includes("DUMMY_PROJECT_ID")) {
+                    console.warn("Firebase init failed due to dummy config. This is expected for local testing.");
+                } else {
+                    showModal("Startup Error", "Could not connect to Firebase. Save/Load features will be disabled.");
+                }
+            }
+        }
+
+        /**
+         * Saves comic to Firestore
+         */
+        async function saveComic() {
+            if (!comicsCollectionRef) {
+                showModal("Error", "Cannot save: Not connected to the database.");
+                return;
+            }
+            const title = document.getElementById('topLeftText').value || "Untitled Comic";
+            globalLoading.classList.remove('hidden');
+            const comicData = {
+                title: title,
+                author: document.getElementById('bottomRightText').value,
+                frameColor: document.getElementById('outerColor').value,
+                // <-- UPGRADE: Save master prompt -->
+                masterPrompt: masterPromptInput.value,
+                // Note: We don't save the master reference image as it can be large
+                panels: JSON.parse(JSON.stringify(comicPanels)),
+                createdAt: new Date().toISOString()
+            };
+            try {
+                await addDoc(comicsCollectionRef, comicData);
+                showModal("Success!", `Comic "${title}" has been saved.`);
+            } catch (error) {
+                console.error("Error saving comic:", error);
+                showModal("Save Failed", "Could not save your comic. Please try again.");
+            } finally {
+                globalLoading.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Loads comic from Firestore
+         */
+        async function loadComic() {
+            const comicId = savedComicsSelect.value;
+            if (!comicId) {
+                showModal("No Comic Selected", "Please choose a comic from the 'My Comics' dropdown to load.");
+                return;
+            }
+            if (!comicsCollectionRef) {
+                 showModal("Error", "Cannot load: Not connected to the database.");
+                 return;
+            }
+            globalLoading.classList.remove('hidden');
+            try {
+                const docRef = doc(db, comicsCollectionRef.path, comicId);
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+
+                    document.getElementById('topLeftText').value = data.title || "";
+                    document.getElementById('bottomRightText').value = data.author || "";
+                    document.getElementById('outerColor').value = data.frameColor || "#f97316";
+                    // <-- UPGRADE: Load master prompt -->
+                    masterPromptInput.value = data.masterPrompt || "";
+
+                    for (let i = 0; i < 3; i++) {
+                        const panelData = data.panels[i];
+                        const panelState = comicPanels[i];
+                        const panelIndex = i; 
+                        const panelNum = i + 1; 
+                        
+                        // Clear existing image state before loading
+                        panelState.baseImage = null;
+                        panelState.baseMimeType = null;
+                        panelState.generatedImage = null;
+
+                        Object.assign(panelState, panelData);
+
+                        document.getElementById(`prompt-${panelNum}`).value = panelState.prompt;
+                        document.getElementById(`dialogue-type-${panelNum}`).value = panelState.dialogueType;
+                        document.getElementById(`dialogue-1-${panelNum}`).value = panelState.dialogue[0] || "";
+                        document.getElementById(`dialogue-2-${panelNum}`).value = panelState.dialogue[1] || "";
+                        document.getElementById(`dialogue-3-${panelNum}`).value = panelState.dialogue[2] || "";
+                        document.getElementById(`narration-${panelNum}`).value = panelState.narration || "";
+                        document.getElementById(`sound-${panelNum}`).value = panelState.soundEffect || "";
+
+                        updateDialogueInputs(panelNum);
+
+                        const imagePreview = document.getElementById(`image-preview-${panelNum}`);
+                        const cropperContainer = document.getElementById(`cropper-container-${panelNum}`);
+                        const uploadPlaceholder = document.getElementById(`upload-placeholder-${panelNum}`);
+                        const fileUpload = document.getElementById(`file-upload-${panelNum}`);
+
+                        const imageToLoad = panelState.generatedImage || panelState.baseImage;
+                        const mimeType = panelState.generatedImage ? 'image/png' : (panelState.baseMimeType || 'image/png');
+
+                        if (croppers[panelIndex]) {
+                            croppers[panelIndex].destroy();
+                            croppers[panelIndex] = null;
+                        }
+                        fileUpload.value = null; // Clear file input
+
+                        if (imageToLoad) {
+                            const dataUrl = `data:${mimeType};base64,${imageToLoad}`;
+                            imagePreview.src = dataUrl;
+                            cropperContainer.classList.remove('hidden');
+                            uploadPlaceholder.classList.add('hidden');
+                            
+                            // Must wait for image to load before initializing cropper
+                            imagePreview.onload = () => {
+                                // Check if cropper already exists (guard against race conditions)
+                                if (croppers[panelIndex]) {
+                                    croppers[panelIndex].destroy();
+                                }
+                                croppers[panelIndex] = new Cropper(imagePreview, {
+                                    aspectRatio: PANEL_ASPECT_RATIO,
+                                    viewMode: 1,
+                                    dragMode: 'move',
+                                    autoCrop: true,
+                                    autoCropArea: 1.0,
+                                    cropBoxResizable: false,
+                                    cropBoxMovable: true,
+                                    guides: false,
+                                    center: true,
+                                    background: false,
+                                    toggleDragModeOnDblclick: false,
+                                });
+                            };
+                             imagePreview.onerror = () => {
+                                console.error(`Error loading image for panel ${panelNum}`);
+                                cropperContainer.classList.add('hidden');
+                                uploadPlaceholder.classList.remove('hidden');
+                            };
+                            
+                        } else {
+                            imagePreview.src = "";
+                            cropperContainer.classList.add('hidden');
+                            uploadPlaceholder.classList.remove('hidden');
+                        }
+                    }
+                    
+                    await drawComicStrip();
+                    showModal("Load Complete", `"${data.title}" has been loaded.`);
+                } else {
+                    showModal("Load Failed", "Could not find the selected comic. It may have been deleted.");
+                }
+            } catch (error) {
+                console.error("Error loading comic:", error);
+                showModal("Load Failed", "An error occurred while loading the comic. Please try again.");
+            } finally {
+                globalLoading.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Populates saved comics list
+         */
+        function loadComicsList() {
+            if (!comicsCollectionRef) return;
+            onSnapshot(query(comicsCollectionRef), (snapshot) => {
+                savedComicsSelect.innerHTML = ""; 
+                if (snapshot.empty) {
+                    const defaultOption = new Option("No saved comics found", "");
+                    defaultOption.disabled = true;
+                    savedComicsSelect.add(defaultOption);
+                    return;
+                }
+                const defaultOption = new Option("Select a comic to load...", "");
+                savedComicsSelect.add(defaultOption);
+                const comics = [];
+                snapshot.forEach((doc) => {
+                    comics.push({ id: doc.id, ...doc.data() });
+                });
+                comics.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+                comics.forEach((comic) => {
+                    const title = comic.title || "Untitled Comic";
+                    const date = new Date(comic.createdAt).toLocaleDateString();
+                    const option = new Option(`${title} (${date})`, comic.id);
+                    savedComicsSelect.add(option);
+                });
+            }, (error) => {
+                console.error("Error listening to comics collection:", error);
+                savedComicsSelect.innerHTML = ""; 
+                const errorOption = new Option("Error loading comics", "");
+                errorOption.disabled = true;
+                savedComicsSelect.add(errorOption);
+            });
+        }
+        
+        /**
+         * Initializes all DOM element references and attaches event listeners.
+         */
+        function initializeAppDom() {
+            // Get global elements
+            canvas = document.getElementById('canvas-output');
+            ctx = canvas.getContext('2d');
+            downloadLink = document.getElementById('downloadLink');
+            generateBtn = document.getElementById('generateBtn');
+            autoStoryBtn = document.getElementById('autoStoryBtn');
+            globalLoading = document.getElementById('global-loading-indicator');
+            saveComicBtn = document.getElementById('saveComicBtn');
+            loadComicBtn = document.getElementById('loadComicBtn');
+            savedComicsSelect = document.getElementById('savedComicsSelect');
+            
+            // <-- UPGRADE: Get new global elements -->
+            masterPromptInput = document.getElementById('masterPrompt');
+            masterReferenceUpload = document.getElementById('masterReferenceUpload');
+            masterReferenceImagePreview = document.getElementById('masterReferenceImagePreview');
+            masterReferencePlaceholder = document.getElementById('masterReferencePlaceholder');
+            clearMasterReferenceBtn = document.getElementById('clearMasterReferenceBtn');
+            generateAllImagesBtn = document.getElementById('generateAllImagesBtn');
+
+
+            // --- Modal Listeners ---
+            document.getElementById('modal-close-btn').addEventListener('click', hideModal);
+            document.getElementById('modal-ok-btn').addEventListener('click', hideModal);
+
+            // --- Global Control Listeners ---
+            autoStoryBtn.addEventListener('click', handleAutoStory);
+            generateBtn.addEventListener('click', drawComicStrip);
+            saveComicBtn.addEventListener('click', saveComic);
+            loadComicBtn.addEventListener('click', loadComic);
+            
+            // <-- UPGRADE: Add new global listeners -->
+            generateAllImagesBtn.addEventListener('click', handleGenerateAllImages);
+            
+            masterReferenceUpload.addEventListener('change', async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                try {
+                    const { base64, dataUrl, mimeType } = await fileToData(file);
+                    masterReferenceImage = { base64, dataUrl, mimeType };
+                    masterReferenceImagePreview.src = dataUrl;
+                    masterReferenceImagePreview.classList.remove('hidden');
+                    masterReferencePlaceholder.classList.add('hidden');
+                    clearMasterReferenceBtn.classList.remove('hidden');
+                } catch (error) {
+                    console.error("Error processing master image:", error);
+                    showModal("File Error", "Could not load the master image file.");
+                }
+            });
+            
+            clearMasterReferenceBtn.addEventListener('click', () => {
+                masterReferenceImage = { base64: null, mimeType: null, dataUrl: null };
+                masterReferenceImagePreview.src = "";
+                masterReferenceImagePreview.classList.add('hidden');
+                masterReferencePlaceholder.classList.remove('hidden');
+                clearMasterReferenceBtn.classList.add('hidden');
+                masterReferenceUpload.value = null; // Reset file input
+            });
+
+            
+            // --- Panel-Specific Listeners ---
+            for (let i = 1; i <= 3; i++) {
+                const panelIndex = i - 1; 
+                const panelState = comicPanels[panelIndex];
+                
+                const fileUpload = document.getElementById(`file-upload-${i}`);
+                const generateImageBtn = document.getElementById(`generate-image-${i}`);
+                // <-- UPGRADE: Get clear image button -->
+                const clearImageBtn = document.getElementById(`clear-image-${i}`);
+                
+                const dialogueTypeSelect = document.getElementById(`dialogue-type-${i}`);
+                const promptInput = document.getElementById(`prompt-${i}`);
+                const narrationInput = document.getElementById(`narration-${i}`);
+                const soundInput = document.getElementById(`sound-${i}`);
+                const dialogueInputs = [
+                    document.getElementById(`dialogue-1-${i}`),
+                    document.getElementById(`dialogue-2-${i}`),
+                    document.getElementById(`dialogue-3-${i}`)
+                ];
+                
+                const loadingIndicator = document.getElementById(`loading-${i}`);
+                const uploadPlaceholder = document.getElementById(`upload-placeholder-${i}`);
+                const cropperContainer = document.getElementById(`cropper-container-${i}`);
+                const imagePreview = document.getElementById(`image-preview-${i}`);
+
+                // 1. File Upload Listener (for non-AI images)
+                fileUpload.addEventListener('change', async (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+
+                    loadingIndicator.classList.remove('hidden');
+                    uploadPlaceholder.classList.add('hidden');
+                    cropperContainer.classList.add('hidden');
+                    
+                    try {
+                        const { base64, dataUrl, mimeType } = await fileToData(file);
+                        panelState.baseImage = base64;
+                        panelState.baseMimeType = mimeType;
+                        panelState.generatedImage = null; // Clear generated image
+
+                        imagePreview.src = dataUrl;
+                        cropperContainer.classList.remove('hidden');
+                        
+                        if (croppers[panelIndex]) {
+                            croppers[panelIndex].destroy();
+                        }
+                        
+                        croppers[panelIndex] = new Cropper(imagePreview, {
+                            aspectRatio: PANEL_ASPECT_RATIO,
+                            viewMode: 1,
+                            dragMode: 'move',
+                            autoCrop: true,
+                            autoCropArea: 1.0,
+                            cropBoxResizable: false,
+                            cropBoxMovable: true,
+                            guides: false,
+                            center: true,
+                            background: false,
+                            toggleDragModeOnDblclick: false,
+                        });
+                        
+                    } catch (error) {
+                        console.error("Error processing file:", error);
+                        showModal("File Error", "Could not load the image file. Please try a different one.");
+                        uploadPlaceholder.classList.remove('hidden');
+                        cropperContainer.classList.add('hidden');
+                    } finally {
+                        loadingIndicator.classList.add('hidden');
+                        e.target.value = null; 
+                    }
+                });
+
+                // 2. Generate AI Image Listener
+                // <-- UPGRADE: Use new handler function -->
+                generateImageBtn.addEventListener('click', () => handleGeneratePanelImage(i));
+
+                // <-- UPGRADE: Add Clear Image Listener -->
+                clearImageBtn.addEventListener('click', () => {
+                    panelState.baseImage = null;
+                    panelState.baseMimeType = null;
+                    panelState.generatedImage = null;
+                    
+                    if (croppers[panelIndex]) {
+                        croppers[panelIndex].destroy();
+                        croppers[panelIndex] = null;
+                    }
+                    
+                    imagePreview.src = "";
+                    cropperContainer.classList.add('hidden');
+                    uploadPlaceholder.classList.remove('hidden');
+                    fileUpload.value = null; // Reset file input
+                });
+
+                // 3. Dialogue Type Change Listener
+                dialogueTypeSelect.addEventListener('change', (e) => {
+                    panelState.dialogueType = e.target.value;
+                    updateDialogueInputs(i);
+                });
+
+                // 4. Text Input Listeners (to update state)
+                promptInput.addEventListener('input', (e) => {
+                    panelState.prompt = e.target.value;
+                });
+                narrationInput.addEventListener('input', (e) => {
+                    panelState.narration = e.target.value;
+                });
+                soundInput.addEventListener('input', (e) => {
+                    panelState.soundEffect = e.target.value;
+                });
+                dialogueInputs.forEach((input, index) => {
+                    input.addEventListener('input', (e) => {
+                        panelState.dialogue[index] = e.target.value;
+                    });
+                });
+                
+                // --- Initial UI Setup ---
+                updateDialogueInputs(i); // Hide/show correct fields on load
+            }
+            
+            // --- Final Setup ---
+            drawPlaceholderCanvas(); // Draw placeholder on load
+        }
+
+        // --- App Entry Point ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeAppDom();
+            initFirebase();
+        });
+
+    </script>
+    
+    <!-- Custom Styles for Theme -->
+    <style>
+        /* ... existing styles ... */
+        .font-bangers {
+            font-family: 'Bangers', cursive;
+            letter-spacing: 0.05em;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        ::-webkit-scrollbar {
+            width: 12px;
+            height: 12px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+        ::-webkit-scrollbar-thumb {
+            background-color: #f97316; 
+            border-radius: 20px;
+            border: 3px solid #1f2937;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background-color: #ea580c;
+        }
+        .file-input-button {
+            cursor: pointer;
+            display: inline-block;
+            padding: 0.5rem 1rem;
+            background-color: #4b5563; 
+            color: #e5e7eb; 
+            border-radius: 0.375rem; 
+            font-weight: 500;
+            transition: background-color 0.15s ease-in-out;
+        }
+        .file-input-button:hover {
+            background-color: #374151;
+        }
+        .spinner {
+            border-top-color: #f97316; 
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .cropper-container {
+            background: #1f2937;
+        }
+        #image-preview-1, #image-preview-2, #image-preview-3, #masterReferenceImagePreview {
+            display: block;
+            max-width: 100%;
+        }
+        select option:disabled {
+            color: #6b7280; 
+        }
+    </style>
+</head>
+
+<!-- Main Body with Dark Gradient -->
+<body class="bg-gradient-to-b from-gray-900 to-black text-gray-200 min-h-screen p-4 md:p-8">
+    
+    <!-- Global Loading Indicator -->
+    <div id="global-loading-indicator" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+        <div class="flex flex-col items-center">
+            <div class="spinner h-16 w-16 animate-spin rounded-full border-4 border-gray-700 border-t-orange-500"></div>
+            <p class="text-white text-xl mt-4 font-medium">Processing...</p>
+        </div>
+    </div>
+    
+    <!-- Modal -->
+    <div id="modal-backdrop" class="hidden fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-40 p-4">
+        <!-- ... existing modal HTML ... -->
+        <div class="bg-gray-800 rounded-lg shadow-2xl max-w-sm w-full border border-gray-700">
+            <div class="flex justify-between items-center p-4 border-b border-gray-700">
+                <h3 id="modal-title" class="text-xl font-semibold text-white">Modal Title</h3>
+                <button id="modal-close-btn" class="text-gray-400 hover:text-white">&times;</button>
+            </div>
+            <div class="p-4">
+                <p id="modal-message" class="text-gray-300">This is the modal message.</p>
+            </div>
+            <div class="p-4 border-t border-gray-700 text-right">
+                <button id="modal-ok-btn" class="px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                    OK
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="max-w-7xl mx-auto flex flex-col lg:flex-row gap-6">
+
+        <!-- Left Column: Controls -->
+        <div class="lg:w-1/2 w-full">
+            <div class="bg-gradient-to-r from-gray-600 via-gray-700 to-gray-600 rounded-xl shadow-2xl border-t border-gray-500 border-b border-gray-800 p-5 sticky top-8">
+                <div class="overflow-y-auto max-h-[calc(100vh-4.5rem)] pr-2">
+
+                    <h1 class="text-4xl font-bangers text-white text-center tracking-wide">
+                        AI Comic <span class="text-orange-500">Creator</span> v5.0
+                    </h1>
+                    
+                    <!-- Global Comic Settings -->
+                    <div class="mt-6 p-4 bg-gray-950 rounded-lg border border-gray-700">
+                        <h2 class="text-xl font-semibold text-white mb-4">Global Settings</h2>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label for="topLeftText" class="block text-sm font-medium text-gray-400 mb-1">Comic Title (Top)</label>
+                                <input type="text" id="topLeftText" placeholder="My Awesome Comic" class="w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                            </div>
+                            <div>
+                                <label for="bottomRightText" class="block text-sm font-medium text-gray-400 mb-1">Creator (Bottom)</label>
+                                <input type="text" id="bottomRightText" placeholder="By Me" class="w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                            </div>
+                            <div class="flex items-end">
+                                <div>
+                                    <label for="outerColor" class="block text-sm font-medium text-gray-400 mb-1">Frame Color</label>
+                                    <input type="color" id="outerColor" value="#f97316" class="w-12 h-10 p-0 border-0 rounded-md cursor-pointer bg-gray-800">
+                                </div>
+                            </div>
+                            
+                            <div class="flex items-end">
+                                <button id="saveComicBtn" class="w-full h-10 px-4 py-2 bg-blue-600 text-white font-medium rounded-md shadow-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50">
+                                    Save Comic
+                                </button>
+                            </div>
+
+                            <!-- API Key Input -->
+                            <div class="md:col-span-2">
+                                <label for="geminiApiKey" class="block text-sm font-medium text-gray-400 mb-1">Your Gemini API Key</label>
+                                <input type="password" id="geminiApiKey" placeholder="Enter your Google AI Studio API Key" class="w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                                <p class="text-xs text-gray-500 mt-1">Required for all AI generation features. Your key is not saved.</p>
+                            </div>
+                            
+                            <!-- <-- UPGRADE: Added Master Prompt -->
+                            <div class="md:col-span-2">
+                                <label for="masterPrompt" class="block text-sm font-medium text-gray-400 mb-1">Master Prompt / Style</label>
+                                <textarea id="masterPrompt" rows="2" class="w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., 1960s comic book style, pop art, vibrant colors"></textarea>
+                            </div>
+
+                            <div class="md:col-span-2 mt-2">
+                                 <label for="savedComicsSelect" class="block text-sm font-medium text-gray-400 mb-1">My Comics</label>
+                                 <div class="flex gap-2">
+                                     <select id="savedComicsSelect" class="w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                                         <option value="" disabled selected>Loading saved comics...</option>
+                                     </select>
+                                     <button id="loadComicBtn" class="px-4 py-2 bg-gray-600 text-white font-medium rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500">
+                                        Load
+                                    </button>
+                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Auto-Story Button -->
+                    <div class="mt-4 p-4 bg-gray-950 rounded-lg border border-gray-700">
+                         <h2 class="text-xl font-semibold text-white mb-2">AI Story Generator</h2>
+                         
+                         <!-- <-- UPGRADE: Added Master Reference Image Uploader -->
+                         <div class="mb-4">
+                            <label class="block text-sm font-medium text-gray-400 mb-2">Master Reference Image (for Style)</label>
+                            <div class="w-full h-32 rounded-md bg-gray-800 border-2 border-dashed border-gray-700 flex items-center justify-center relative">
+                                <div id="masterReferencePlaceholder" class="text-center text-gray-500 pointer-events-none">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l-1.586-1.586a2 2 0 00-2.828 0L6 14m6-6l.01.01" /></svg>
+                                    <span class="text-xs">Upload one image for AI style reference</span>
+                                </div>
+                                <img id="masterReferenceImagePreview" src="" alt="Master Preview" class="hidden h-full w-full object-contain rounded-md">
+                            </div>
+                            <div class="flex gap-2 mt-2">
+                                <label for="masterReferenceUpload" class="file-input-button text-sm w-2/3 text-center">Upload Master Image</label>
+                                <input id="masterReferenceUpload" type="file" class="hidden" accept="image/*">
+                                <button id="clearMasterReferenceBtn" class="hidden w-1/3 text-sm px-2 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">Clear</button>
+                            </div>
+                         </div>
+                         
+                         <p class="text-sm text-gray-400 mb-4">Use 'Auto-Generate Story' to create prompts, then 'Generate All Images' to create the art.</p>
+                         
+                         <div class="flex flex-col sm:flex-row gap-2">
+                             <button id="autoStoryBtn" class="w-full sm:w-1/2 px-6 py-3 bg-orange-600 text-white font-bold rounded-md shadow-lg hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-gray-700 transition duration-150 ease-in-out disabled:opacity-50">
+                                Auto-Generate Story
+                            </button>
+                            <!-- <-- UPGRADE: Added Generate All Images Button -->
+                            <button id="generateAllImagesBtn" class="w-full sm:w-1/2 px-6 py-3 bg-indigo-600 text-white font-bold rounded-md shadow-lg hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-700 transition duration-150 ease-in-out disabled:opacity-50">
+                                Generate All Images
+                            </button>
+                         </div>
+                    </div>
+
+                    <!-- Panel Controls -->
+                    <div class="mt-6 space-y-6">
+                        <!-- Panel 1 -->
+                        <div class="bg-gray-950 rounded-lg p-4 border border-gray-800 shadow-lg">
+                            <h3 class="text-lg font-semibold text-white mb-3">Panel 1</h3>
+                            <div class="space-y-2">
+                                <div class="w-full h-48 rounded-md bg-gray-800 border border-gray-700 flex items-center justify-center relative overflow:hidden">
+                                    <div id="upload-placeholder-1" class="text-center text-gray-500 pointer-events-none">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l-1.586-1.586a2 2 0 00-2.828 0L6 14m6-6l.01.01" /></svg>
+                                        <span class="text-xs">Upload Base Image or Generate AI Image</span>
+                                    </div>
+                                    <div id="cropper-container-1" class="hidden w-full h-full">
+                                        <img id="image-preview-1" class="block max-w-full" src="" alt="Panel 1 Preview">
+                                    </div>
+                                    <div id="loading-1" class="hidden absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                                        <div class="spinner h-8 w-8 animate-spin rounded-full border-2 border-gray-500 border-t-orange-500"></div>
+                                    </div>
+                                </div>
+                                <!-- <-- UPGRADE: Button layout changed, added Clear -->
+                                <div class="grid grid-cols-3 gap-2">
+                                    <label for="file-upload-1" class="file-input-button text-sm text-center">Upload</label>
+                                    <input id="file-upload-1" type="file" class="hidden" accept="image/*">
+                                    <button id="generate-image-1" class="w-full text-sm px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700">Generate AI</button>
+                                    <button id="clear-image-1" class="w-full text-sm px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">Clear</button>
+                                </div>
+                            </div>
+                            <!-- Text Inputs -->
+                            <div class="mt-4 space-y-3">
+                                <div>
+                                    <label for="prompt-1" class="block text-sm font-medium text-gray-400">AI Image Prompt (Panel 1)</label>
+                                    <textarea id="prompt-1" rows="2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., A superhero flying over a city"></textarea>
+                                </div>
+                                <div>
+                                    <label for="dialogue-type-1" class="block text-sm font-medium text-gray-400">Text Type</label>
+                                    <select id="dialogue-type-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                                        <option value="none">None</option>
+                                        <option value="1">1 Speech Bubble</option>
+                                        <option value="2">2 Speech Bubbles</option>
+                                        <option value="3">3 Speech Bubbles</option>
+                                        <option value="narration">Narration Box</option>
+                                        <option value="sound">Sound Effect</option>
+                                    </select>
+                                </div>
+                                <div id="dialogue-group-1-1" class="hidden">
+                                    <label for="dialogue-1-1" class="block text-sm font-medium text-gray-400">Speech Bubble 1</label>
+                                    <input type="text" id="dialogue-1-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="What's happening?">
+                                </div>
+                                <div id="dialogue-group-2-1" class="hidden">
+                                    <label for="dialogue-2-1" class="block text-sm font-medium text-gray-400">Speech Bubble 2</label>
+                                    <input type="text" id="dialogue-2-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="I don't know!">
+                                </div>
+                                <div id="dialogue-group-3-1" class="hidden">
+                                    <label for="dialogue-3-1" class="block text-sm font-medium text-gray-400">Speech Bubble 3</label>
+                                    <input type="text" id="dialogue-3-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="Look out!">
+                                </div>
+                                <div id="narration-group-1" class="hidden">
+                                    <label for="narration-1" class="block text-sm font-medium text-gray-400">Narration Text</label>
+                                    <input type="text" id="narration-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="Meanwhile, in the city...">
+                                </div>
+                                <div id="sound-group-1" class="hidden">
+                                    <label for="sound-1" class="block text-sm font-medium text-gray-400">Sound Effect Text</label>
+                                    <input type="text" id="sound-1" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="KA-BOOM!">
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Panel 2 -->
+                        <div class="bg-gray-950 rounded-lg p-4 border border-gray-800 shadow-lg">
+                            <h3 class="text-lg font-semibold text-white mb-3">Panel 2</h3>
+                            <div class="space-y-2">
+                                <div class="w-full h-48 rounded-md bg-gray-800 border border-gray-700 flex items-center justify-center relative overflow:hidden">
+                                    <div id="upload-placeholder-2" class="text-center text-gray-500 pointer-events-none">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l-1.586-1.586a2 2 0 00-2.828 0L6 14m6-6l.01.01" /></svg>
+                                        <span class="text-xs">Upload Base Image or Generate AI Image</span>
+                                    </div>
+                                    <div id="cropper-container-2" class="hidden w-full h-full">
+                                        <img id="image-preview-2" class="block max-w-full" src="" alt="Panel 2 Preview">
+                                    </div>
+                                    <div id="loading-2" class="hidden absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                                        <div class="spinner h-8 w-8 animate-spin rounded-full border-2 border-gray-500 border-t-orange-500"></div>
+                                    </div>
+                                </div>
+                                <!-- <-- UPGRADE: Button layout changed, added Clear -->
+                                <div class="grid grid-cols-3 gap-2">
+                                    <label for="file-upload-2" class="file-input-button text-sm text-center">Upload</label>
+                                    <input id="file-upload-2" type="file" class="hidden" accept="image/*">
+                                    <button id="generate-image-2" class="w-full text-sm px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700">Generate AI</button>
+                                    <button id="clear-image-2" class="w-full text-sm px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">Clear</button>
+                                </div>
+                            </div>
+                            <!-- Text Inputs -->
+                            <div class="mt-4 space-y-3">
+                                <div>
+                                    <label for="prompt-2" class="block text-sm font-medium text-gray-400">AI Image Prompt (Panel 2)</label>
+                                    <textarea id="prompt-2" rows="2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., A close-up of the villain laughing"></textarea>
+                                </div>
+                                <div>
+                                    <label for="dialogue-type-2" class="block text-sm font-medium text-gray-400">Text Type</label>
+                                    <select id="dialogue-type-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                                        <option value="none">None</option>
+                                        <option value="1">1 Speech Bubble</option>
+                                        <option value="2">2 Speech Bubbles</option>
+                                        <option value="3">3 Speech Bubbles</option>
+                                        <option value="narration">Narration Box</option>
+                                        <option value="sound">Sound Effect</option>
+                                    </select>
+                                </div>
+                                <div id="dialogue-group-1-2" class="hidden">
+                                    <label for="dialogue-1-2" class="block text-sm font-medium text-gray-400">Speech Bubble 1</label>
+                                    <input type="text" id="dialogue-1-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="dialogue-group-2-2" class="hidden">
+                                    <label for="dialogue-2-2" class="block text-sm font-medium text-gray-400">Speech Bubble 2</label>
+                                    <input type="text" id="dialogue-2-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="dialogue-group-3-2" class="hidden">
+                                    <label for="dialogue-3-2" class="block text-sm font-medium text-gray-400">Speech Bubble 3</label>
+                                    <input type="text" id="dialogue-3-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="narration-group-2" class="hidden">
+                                    <label for="narration-2" class="block text-sm font-medium text-gray-400">Narration Text</label>
+                                    <input type="text" id="narration-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="sound-group-2" class="hidden">
+                                    <label for="sound-2" class="block text-sm font-medium text-gray-400">Sound Effect Text</label>
+                                    <input type="text" id="sound-2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="CRASH!">
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Panel 3 -->
+                        <div class="bg-gray-950 rounded-lg p-4 border border-gray-800 shadow-lg">
+                            <h3 class="text-lg font-semibold text-white mb-3">Panel 3</h3>
+                            <div class="space-y-2">
+                                <div class="w-full h-48 rounded-md bg-gray-800 border border-gray-700 flex items-center justify-center relative overflow:hidden">
+                                    <div id="upload-placeholder-3" class="text-center text-gray-500 pointer-events-none">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 mx-auto" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l-1.586-1.586a2 2 0 00-2.828 0L6 14m6-6l.01.01" /></svg>
+                                        <span class="text-xs">Upload Base Image or Generate AI Image</span>
+                                    </div>
+                                    <div id="cropper-container-3" class="hidden w-full h-full">
+                                        <img id="image-preview-3" class="block max-w-full" src="" alt="Panel 3 Preview">
+                                    </div>
+                                    <div id="loading-3" class="hidden absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center">
+                                        <div class="spinner h-8 w-8 animate-spin rounded-full border-2 border-gray-500 border-t-orange-500"></div>
+                                    </div>
+                                </div>
+                                <!-- <-- UPGRADE: Button layout changed, added Clear -->
+                                <div class="grid grid-cols-3 gap-2">
+                                    <label for="file-upload-3" class="file-input-button text-sm text-center">Upload</label>
+                                    <input id="file-upload-3" type="file" class="hidden" accept="image/*">
+                                    <button id="generate-image-3" class="w-full text-sm px-4 py-2 bg-orange-600 text-white rounded-md hover:bg-orange-700">Generate AI</button>
+                                    <button id="clear-image-3" class="w-full text-sm px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700">Clear</button>
+                                </div>
+                            </div>
+                            <!-- Text Inputs -->
+                            <div class="mt-4 space-y-3">
+                                <div>
+                                    <label for="prompt-3" class="block text-sm font-medium text-gray-400">AI Image Prompt (Panel 3)</label>
+                                    <textarea id="prompt-3" rows="2" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500" placeholder="e.g., The city saved, sun rising"></textarea>
+                                </div>
+                                <div>
+                                    <label for="dialogue-type-3" class="block text-sm font-medium text-gray-400">Text Type</label>
+                                    <select id="dialogue-type-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-500">
+                                        <option value="none">None</option>
+                                        <option value="1">1 Speech Bubble</option>
+                                        <option value="2">2 Speech Bubbles</option>
+                                        <option value="3">3 Speech Bubbles</option>
+                                        <option value="narration">Narration Box</option>
+                                        <option value="sound">Sound Effect</option>
+                                    </select>
+                                </div>
+                                <div id="dialogue-group-1-3" class="hidden">
+                                    <label for="dialogue-1-3" class="block text-sm font-medium text-gray-400">Speech Bubble 1</label>
+                                    <input type="text" id="dialogue-1-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="dialogue-group-2-3" class="hidden">
+                                    <label for="dialogue-2-3" class="block text-sm font-medium text-gray-400">Speech Bubble 2</label>
+                                    <input type="text" id="dialogue-2-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="dialogue-group-3-3" class="hidden">
+                                    <label for="dialogue-3-3" class="block text-sm font-medium text-gray-400">Speech Bubble 3</label>
+                                    <input type="text" id="dialogue-3-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="narration-group-3" class="hidden">
+                                    <label for="narration-3" class="block text-sm font-medium text-gray-400">Narration Text</label>
+                                    <input type="text" id="narration-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="">
+                                </div>
+                                <div id="sound-group-3" class="hidden">
+                                    <label for="sound-3" class="block text-sm font-medium text-gray-400">Sound Effect Text</label>
+                                    <input type="text" id="sound-3" class="mt-1 w-full bg-gray-800 text-gray-200 border border-gray-700 rounded-md px-3 py-2" placeholder="THE END?">
+                                </div>
+                            </div>
+                        </div>
+
+                    </div> 
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column: Canvas Output -->
+        <div class="lg:w-1/2 w-full flex-grow flex flex-col">
+            <div class="bg-gray-950 rounded-lg p-4 border border-gray-800 shadow-lg sticky top-8">
+                <!-- ... existing right column HTML ... -->
+                <div class="flex justify-between items-center mb-4">
+                     <h2 class="text-xl font-semibold text-white">Final Comic Strip</h2>
+                     <a id="downloadLink" style="display: none;" download="ai-comic.png" class="px-4 py-2 bg-gray-600 text-white text-sm font-medium rounded-md hover:bg-gray-700">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline-block -mt-1 mr-1" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 9.293a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" /></svg>
+                        Download
+                    </a>
+                </div>
+                
+                <button id="generateBtn" class="w-full px-6 py-4 mb-4 bg-gradient-to-r from-orange-500 to-orange-600 text-white font-bold text-lg rounded-md shadow-lg hover:from-orange-600 hover:to-orange-700 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-gray-950 transition duration-150 ease-in-out">
+                    Generate Final Comic Strip
+                </button>
+                
+                <div class="w-full aspect-[2/1] bg-gray-800 rounded-md overflow-hidden border border-gray-700">
+                    <canvas id="canvas-output" class="w-full h-full"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
